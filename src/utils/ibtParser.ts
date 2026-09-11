@@ -1,9 +1,3 @@
-export interface TelemetryChannel {
-  name: string;
-  unit: string;
-  data: number[];
-}
-
 export interface LapData {
   lapNum: number;
   sampleCount: number;
@@ -32,11 +26,10 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   const bufLen = view.getInt32(24, true);
   const bufOffset = view.getInt32(52, true);
 
-  const vars: { name: string; type: number; offset: number; unit: string }[] = [];
+  const vars: { name: string; offset: number }[] = [];
 
   for (let i = 0; i < numVars; i++) {
     const offset = varHeaderOffset + i * 144;
-    const type = view.getInt32(offset, true);
     const varOffset = view.getInt32(offset + 4, true);
 
     let name = '';
@@ -45,22 +38,13 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
       if (charCode === 0) break;
       name += String.fromCharCode(charCode);
     }
-
-    let unit = '';
-    for (let j = 0; j < 32; j++) {
-      const charCode = view.getUint8(offset + 48 + j);
-      if (charCode === 0) break;
-      unit += String.fromCharCode(charCode);
-    }
-
-    vars.push({ name, type, offset: varOffset, unit });
+    vars.push({ name, offset: varOffset });
   }
 
   const findVar = (name: string) => vars.find((v) => v.name === name);
 
   const lapVar = findVar('Lap');
   const lapDistVar = findVar('LapDist');
-  const lapDistPctVar = findVar('LapDistPct');
   const speedVar = findVar('Speed');
   const throttleVar = findVar('Throttle');
   const brakeVar = findVar('Brake');
@@ -68,39 +52,45 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   const gearVar = findVar('Gear');
   const rpmVar = findVar('RPM');
 
-  const lapMap = new Map<number, LapData>();
-  const sampleRate = 1 / 60; // 60 Hz iRacing telemetry
+  const laps: LapData[] = [];
+  let currentLapNum = 1;
+  let lastDist = -1;
+
+  function createNewLap(num: number): LapData {
+    return {
+      lapNum: num,
+      sampleCount: 0,
+      lapDist: [],
+      speed: [],
+      throttle: [],
+      brake: [],
+      steering: [],
+      gear: [],
+      rpm: [],
+      time: [],
+    };
+  }
+
+  let activeLap = createNewLap(currentLapNum);
+  const sampleRate = 1 / 60;
 
   for (let i = 0; i < bufCount; i++) {
     const frameOffset = bufOffset + i * bufLen;
 
-    const currentLap = lapVar ? view.getInt32(frameOffset + lapVar.offset, true) : 1;
-    if (currentLap < 1) continue; // Skip outlaps / pit garage samples (Lap <= 0)
+    const rawLap = lapVar ? view.getInt32(frameOffset + lapVar.offset, true) : 1;
+    const dist = lapDistVar ? view.getFloat32(frameOffset + lapDistVar.offset, true) : i * 0.5;
 
-    if (!lapMap.has(currentLap)) {
-      lapMap.set(currentLap, {
-        lapNum: currentLap,
-        sampleCount: 0,
-        lapDist: [],
-        speed: [],
-        throttle: [],
-        brake: [],
-        steering: [],
-        gear: [],
-        rpm: [],
-        time: [],
-      });
+    // Detect lap boundary: explicit Lap increase OR LapDist drop from > 500m to < 100m
+    const distReset = lastDist > 500 && dist < 100 && dist >= 0;
+    const lapChanged = rawLap > currentLapNum && rawLap > 0;
+
+    if ((distReset || lapChanged) && activeLap.sampleCount > 300) {
+      laps.push(activeLap);
+      currentLapNum = lapChanged ? rawLap : currentLapNum + 1;
+      activeLap = createNewLap(currentLapNum);
     }
 
-    const lapData = lapMap.get(currentLap)!;
-
-    // Retrieve Lap Distance (m) or Lap Distance Pct * 100
-    let dist = 0;
-    if (lapDistVar) {
-      dist = view.getFloat32(frameOffset + lapDistVar.offset, true);
-    } else if (lapDistPctVar) {
-      dist = view.getFloat32(frameOffset + lapDistPctVar.offset, true) * 100;
-    }
+    lastDist = dist;
 
     const speed = speedVar ? view.getFloat32(frameOffset + speedVar.offset, true) * 3.6 : 0;
     const throttle = throttleVar ? view.getFloat32(frameOffset + throttleVar.offset, true) * 100 : 0;
@@ -109,56 +99,54 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
     const gear = gearVar ? view.getInt32(frameOffset + gearVar.offset, true) : 0;
     const rpm = rpmVar ? view.getFloat32(frameOffset + rpmVar.offset, true) : 0;
 
-    const sampleTime = lapData.sampleCount * sampleRate;
+    activeLap.lapDist.push(dist >= 0 ? dist : activeLap.sampleCount * 0.5);
+    activeLap.speed.push(speed);
+    activeLap.throttle.push(throttle);
+    activeLap.brake.push(brake);
+    activeLap.steering.push(steer);
+    activeLap.gear.push(gear);
+    activeLap.rpm.push(rpm);
+    activeLap.time.push(activeLap.sampleCount * sampleRate);
 
-    lapData.lapDist.push(dist);
-    lapData.speed.push(speed);
-    lapData.throttle.push(throttle);
-    lapData.brake.push(brake);
-    lapData.steering.push(steer);
-    lapData.gear.push(gear);
-    lapData.rpm.push(rpm);
-    lapData.time.push(sampleTime);
-
-    lapData.sampleCount++;
+    activeLap.sampleCount++;
   }
 
-  // Filter out incomplete laps and fix X-axis ordering for uPlot
-  const validLaps = Array.from(lapMap.values())
-    .filter((l) => l.sampleCount > 100)
-    .map((lap) => {
-      // Check if distance values are monotonically increasing; if not, fallback to sample index/distance proxy
-      let isMonotonic = true;
-      for (let i = 1; i < lap.lapDist.length; i++) {
-        if (lap.lapDist[i] < lap.lapDist[i - 1]) {
-          isMonotonic = false;
-          break;
-        }
-      }
+  if (activeLap.sampleCount > 300) {
+    laps.push(activeLap);
+  }
 
-      // If distance resets inside the lap, enforce monotonic distance array using index steps
-      if (!isMonotonic || lap.lapDist[lap.lapDist.length - 1] === 0) {
-        lap.lapDist = lap.lapDist.map((_, idx) => idx * 0.5); // Approx distance step
-      }
+  // Ensure X-axis is strictly monotonic for uPlot
+  const sanitizedLaps = laps.map((lap) => {
+    const cleanDist: number[] = [];
+    let currentMax = -1;
 
-      return lap;
-    });
+    for (let i = 0; i < lap.lapDist.length; i++) {
+      let d = lap.lapDist[i];
+      if (d <= currentMax) {
+        d = currentMax + 0.01; // Force strictly increasing step
+      }
+      currentMax = d;
+      cleanDist.push(d);
+    }
+
+    return { ...lap, lapDist: cleanDist };
+  });
 
   return {
     fileName,
     channelsAvailable: ['Speed', 'Throttle', 'Brake', 'Steering', 'Gear', 'RPM', 'Time Delta'],
-    laps: validLaps,
+    laps: sanitizedLaps,
   };
 }
 
 export function calculateTimeDelta(refLap: LapData, compLap: LapData): number[] {
   const delta: number[] = [];
-  const minLen = Math.min(refLap.speed.length, compLap.speed.length);
+  const len = compLap.lapDist.length;
 
-  for (let i = 0; i < compLap.lapDist.length; i++) {
-    const idx = Math.min(i, minLen - 1);
+  for (let i = 0; i < len; i++) {
     const compTime = compLap.time[i];
-    const refTime = refLap.time[idx] || 0;
+    const refIdx = Math.min(i, refLap.time.length - 1);
+    const refTime = refLap.time[refIdx] || 0;
     delta.push(compTime - refTime);
   }
 
