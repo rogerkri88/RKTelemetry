@@ -1,7 +1,7 @@
 import React, { useRef, useState, useEffect } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
-import { parseIBT, ParsedIBT, calculateTimeDelta } from './utils/ibtParser';
+import { parseIBT, calculateTimeDelta, type ParsedIBT } from './utils/ibtParser';
 
 export function App() {
   const chartRef = useRef<HTMLDivElement>(null);
