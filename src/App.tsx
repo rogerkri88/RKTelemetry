@@ -3,7 +3,6 @@ import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import { parseIBT, calculateTimeDelta, type ParsedIBT, type LapData } from './utils/ibtParser';
 
-// Linear interpolation to resample array to match base lap distance length
 function resampleArray(sourceDist: number[], sourceData: number[], targetDist: number[]): number[] {
   if (!sourceDist.length || !sourceData.length) return targetDist.map(() => 0);
 
@@ -183,11 +182,11 @@ export function App() {
         <div style={{ padding: '15px', border: '1px solid #444', borderRadius: '8px' }}>
           <h3>Comparison Lap / File 2 (Optional)</h3>
           <input type="file" accept=".ibt" onChange={(e) => handleFileUpload(e, 2)} />
-          {session1 && (
+          {(session2 || session1) && (
             <div style={{ marginTop: '10px' }}>
               <label>Select Lap: </label>
               <select value={compLapNum} onChange={(e) => setCompLapNum(Number(e.target.value))}>
-                {(session2 || session1).laps.map((l) => (
+                {(session2 || session1)!.laps.map((l) => (
                   <option key={l.lapNum} value={l.lapNum}>
                     Lap {l.lapNum} ({(l.time[l.time.length - 1] || 0).toFixed(2)}s - {l.sampleCount} pts)
                   </option>

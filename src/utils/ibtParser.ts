@@ -26,10 +26,11 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   const bufLen = view.getInt32(24, true);
   const bufOffset = view.getInt32(52, true);
 
-  const vars: { name: string; offset: number }[] = [];
+  const vars: { name: string; offset: number; type: number }[] = [];
 
   for (let i = 0; i < numVars; i++) {
     const offset = varHeaderOffset + i * 144;
+    const type = view.getInt32(offset, true);
     const varOffset = view.getInt32(offset + 4, true);
 
     let name = '';
@@ -38,13 +39,14 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
       if (charCode === 0) break;
       name += String.fromCharCode(charCode);
     }
-    vars.push({ name, offset: varOffset });
+    vars.push({ name, offset: varOffset, type });
   }
 
   const findVar = (name: string) => vars.find((v) => v.name === name);
 
   const lapVar = findVar('Lap');
   const lapDistVar = findVar('LapDist');
+  const lapDistPctVar = findVar('LapDistPct');
   const speedVar = findVar('Speed');
   const throttleVar = findVar('Throttle');
   const brakeVar = findVar('Brake');
@@ -52,7 +54,7 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   const gearVar = findVar('Gear');
   const rpmVar = findVar('RPM');
 
-  const laps: LapData[] = [];
+  const rawLaps: LapData[] = [];
   let currentLapNum = 1;
   let lastDist = -1;
 
@@ -78,19 +80,31 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
     const frameOffset = bufOffset + i * bufLen;
 
     const rawLap = lapVar ? view.getInt32(frameOffset + lapVar.offset, true) : 1;
-    const dist = lapDistVar ? view.getFloat32(frameOffset + lapDistVar.offset, true) : i * 0.5;
+    
+    // Check distance in meters (LapDist) or percent * 4200m estimate (LapDistPct)
+    let dist = -1;
+    if (lapDistVar) {
+      dist = view.getFloat32(frameOffset + lapDistVar.offset, true);
+    } else if (lapDistPctVar) {
+      const pct = view.getFloat32(frameOffset + lapDistPctVar.offset, true);
+      if (pct >= 0) dist = pct * 4250; // Road Atlanta full approx ~4250m
+    }
 
-    // Detect lap boundary: explicit Lap increase OR LapDist drop from > 500m to < 100m
-    const distReset = lastDist > 500 && dist < 100 && dist >= 0;
-    const lapChanged = rawLap > currentLapNum && rawLap > 0;
+    // Lap boundary detection:
+    // 1. Explicit Lap variable bump in telemetry
+    // 2. LapDist drop: last distance was > 200m and current distance dropped by more than 100m
+    const lapVarIncremented = rawLap > currentLapNum && rawLap > 0;
+    const distDropped = lastDist > 200 && dist >= 0 && (lastDist - dist > 100);
 
-    if ((distReset || lapChanged) && activeLap.sampleCount > 300) {
-      laps.push(activeLap);
-      currentLapNum = lapChanged ? rawLap : currentLapNum + 1;
+    if ((lapVarIncremented || distDropped) && activeLap.sampleCount > 300) {
+      rawLaps.push(activeLap);
+      currentLapNum = lapVarIncremented ? rawLap : currentLapNum + 1;
       activeLap = createNewLap(currentLapNum);
     }
 
-    lastDist = dist;
+    if (dist >= 0) {
+      lastDist = dist;
+    }
 
     const speed = speedVar ? view.getFloat32(frameOffset + speedVar.offset, true) * 3.6 : 0;
     const throttle = throttleVar ? view.getFloat32(frameOffset + throttleVar.offset, true) * 100 : 0;
@@ -99,6 +113,7 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
     const gear = gearVar ? view.getInt32(frameOffset + gearVar.offset, true) : 0;
     const rpm = rpmVar ? view.getFloat32(frameOffset + rpmVar.offset, true) : 0;
 
+    // Build sample data
     activeLap.lapDist.push(dist >= 0 ? dist : activeLap.sampleCount * 0.5);
     activeLap.speed.push(speed);
     activeLap.throttle.push(throttle);
@@ -112,24 +127,28 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   }
 
   if (activeLap.sampleCount > 300) {
-    laps.push(activeLap);
+    rawLaps.push(activeLap);
   }
 
-  // Ensure X-axis is strictly monotonic for uPlot
-  const sanitizedLaps = laps.map((lap) => {
+  // Renumber and ensure X-axis is strictly monotonic (strictly increasing) for uPlot
+  const sanitizedLaps = rawLaps.map((lap, index) => {
     const cleanDist: number[] = [];
     let currentMax = -1;
 
     for (let i = 0; i < lap.lapDist.length; i++) {
       let d = lap.lapDist[i];
       if (d <= currentMax) {
-        d = currentMax + 0.01; // Force strictly increasing step
+        d = currentMax + 0.001; // Force strictly increasing step
       }
       currentMax = d;
       cleanDist.push(d);
     }
 
-    return { ...lap, lapDist: cleanDist };
+    return {
+      ...lap,
+      lapNum: index + 1,
+      lapDist: cleanDist,
+    };
   });
 
   return {
