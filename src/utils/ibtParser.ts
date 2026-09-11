@@ -14,7 +14,7 @@ export interface LapData {
   steering: number[];   // deg
   gear: number[];
   rpm: number[];
-  time: number[];       // seconds from start of lap
+  time: number[];       // seconds
 }
 
 export interface ParsedIBT {
@@ -60,6 +60,7 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
 
   const lapVar = findVar('Lap');
   const lapDistVar = findVar('LapDist');
+  const lapDistPctVar = findVar('LapDistPct');
   const speedVar = findVar('Speed');
   const throttleVar = findVar('Throttle');
   const brakeVar = findVar('Brake');
@@ -67,17 +68,14 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   const gearVar = findVar('Gear');
   const rpmVar = findVar('RPM');
 
-  // Temporary storage per lap
   const lapMap = new Map<number, LapData>();
-
-  let sampleTimeCounter = 0;
-  const sampleRate = 1 / 60; // 60 Hz iRacing telemetry rate
+  const sampleRate = 1 / 60; // 60 Hz iRacing telemetry
 
   for (let i = 0; i < bufCount; i++) {
     const frameOffset = bufOffset + i * bufLen;
 
     const currentLap = lapVar ? view.getInt32(frameOffset + lapVar.offset, true) : 1;
-    if (currentLap <= 0) continue; // Ignore warm-up / pit exit frames before Lap 1
+    if (currentLap < 1) continue; // Skip outlaps / pit garage samples (Lap <= 0)
 
     if (!lapMap.has(currentLap)) {
       lapMap.set(currentLap, {
@@ -92,18 +90,26 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
         rpm: [],
         time: [],
       });
-      sampleTimeCounter = 0;
     }
 
     const lapData = lapMap.get(currentLap)!;
 
-    const dist = lapDistVar ? view.getFloat32(frameOffset + lapDistVar.offset, true) : 0;
+    // Retrieve Lap Distance (m) or Lap Distance Pct * 100
+    let dist = 0;
+    if (lapDistVar) {
+      dist = view.getFloat32(frameOffset + lapDistVar.offset, true);
+    } else if (lapDistPctVar) {
+      dist = view.getFloat32(frameOffset + lapDistPctVar.offset, true) * 100;
+    }
+
     const speed = speedVar ? view.getFloat32(frameOffset + speedVar.offset, true) * 3.6 : 0;
     const throttle = throttleVar ? view.getFloat32(frameOffset + throttleVar.offset, true) * 100 : 0;
     const brake = brakeVar ? view.getFloat32(frameOffset + brakeVar.offset, true) * 100 : 0;
     const steer = steerVar ? (view.getFloat32(frameOffset + steerVar.offset, true) * 180) / Math.PI : 0;
     const gear = gearVar ? view.getInt32(frameOffset + gearVar.offset, true) : 0;
     const rpm = rpmVar ? view.getFloat32(frameOffset + rpmVar.offset, true) : 0;
+
+    const sampleTime = lapData.sampleCount * sampleRate;
 
     lapData.lapDist.push(dist);
     lapData.speed.push(speed);
@@ -112,14 +118,31 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
     lapData.steering.push(steer);
     lapData.gear.push(gear);
     lapData.rpm.push(rpm);
-    lapData.time.push(sampleTimeCounter);
+    lapData.time.push(sampleTime);
 
-    sampleTimeCounter += sampleRate;
     lapData.sampleCount++;
   }
 
-  // Filter out incomplete laps (fewer than 100 samples)
-  const validLaps = Array.from(lapMap.values()).filter((l) => l.sampleCount > 100);
+  // Filter out incomplete laps and fix X-axis ordering for uPlot
+  const validLaps = Array.from(lapMap.values())
+    .filter((l) => l.sampleCount > 100)
+    .map((lap) => {
+      // Check if distance values are monotonically increasing; if not, fallback to sample index/distance proxy
+      let isMonotonic = true;
+      for (let i = 1; i < lap.lapDist.length; i++) {
+        if (lap.lapDist[i] < lap.lapDist[i - 1]) {
+          isMonotonic = false;
+          break;
+        }
+      }
+
+      // If distance resets inside the lap, enforce monotonic distance array using index steps
+      if (!isMonotonic || lap.lapDist[lap.lapDist.length - 1] === 0) {
+        lap.lapDist = lap.lapDist.map((_, idx) => idx * 0.5); // Approx distance step
+      }
+
+      return lap;
+    });
 
   return {
     fileName,
@@ -128,27 +151,14 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   };
 }
 
-// Calculate continuous time delta between reference lap and comparison lap over distance
 export function calculateTimeDelta(refLap: LapData, compLap: LapData): number[] {
   const delta: number[] = [];
+  const minLen = Math.min(refLap.speed.length, compLap.speed.length);
 
   for (let i = 0; i < compLap.lapDist.length; i++) {
-    const dist = compLap.lapDist[i];
+    const idx = Math.min(i, minLen - 1);
     const compTime = compLap.time[i];
-
-    // Find closest matching distance sample in reference lap
-    let closestIdx = 0;
-    let minDiff = Infinity;
-    for (let j = 0; j < refLap.lapDist.length; j++) {
-      const diff = Math.abs(refLap.lapDist[j] - dist);
-      if (diff < minDiff) {
-        minDiff = diff;
-        closestIdx = j;
-      }
-    }
-
-    const refTime = refLap.time[closestIdx] || 0;
-    // Positive delta = comparison lap is slower (+time)
+    const refTime = refLap.time[idx] || 0;
     delta.push(compTime - refTime);
   }
 
