@@ -50,6 +50,7 @@ export function App() {
       <h1>RKTelemetry Viewer</h1>
       <p>Select an iRacing <code>.ibt</code> file to analyze telemetry.</p>
       <input type="file" accept=".ibt" onChange={handleFileUpload} style={{ marginBottom: '20px' }} />
+      {fileName && <p style={{ fontSize: '14px', color: '#666' }}>Loaded file: <strong>{fileName}</strong></p>}
       <div ref={chartRef} />
     </div>
   );
