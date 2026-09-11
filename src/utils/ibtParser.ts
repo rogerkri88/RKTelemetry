@@ -17,6 +17,24 @@ export interface ParsedIBT {
   laps: LapData[];
 }
 
+// iRacing Data Types (irsdk_VarType)
+// 0 = char, 1 = bool, 2 = int32, 3 = bitfield, 4 = float32, 5 = float64
+function readVarValue(view: DataView, offset: number, type: number): number {
+  switch (type) {
+    case 1: // bool
+      return view.getUint8(offset);
+    case 2: // int32
+    case 3: // bitfield
+      return view.getInt32(offset, true);
+    case 4: // float32
+      return view.getFloat32(offset, true);
+    case 5: // float64
+      return view.getFloat64(offset, true);
+    default:
+      return 0;
+  }
+}
+
 export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT {
   const view = new DataView(arrayBuffer);
 
@@ -29,13 +47,13 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   const vars: { name: string; offset: number; type: number }[] = [];
 
   for (let i = 0; i < numVars; i++) {
-    const offset = varHeaderOffset + i * 144;
-    const type = view.getInt32(offset, true);
-    const varOffset = view.getInt32(offset + 4, true);
+    const headerPos = varHeaderOffset + i * 144;
+    const type = view.getInt32(headerPos, true);
+    const varOffset = view.getInt32(headerPos + 4, true);
 
     let name = '';
     for (let j = 0; j < 32; j++) {
-      const charCode = view.getUint8(offset + 16 + j);
+      const charCode = view.getUint8(headerPos + 16 + j);
       if (charCode === 0) break;
       name += String.fromCharCode(charCode);
     }
@@ -79,26 +97,25 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
   for (let i = 0; i < bufCount; i++) {
     const frameOffset = bufOffset + i * bufLen;
 
-    const rawLap = lapVar ? view.getInt32(frameOffset + lapVar.offset, true) : 1;
+    const rawLap = lapVar ? readVarValue(view, frameOffset + lapVar.offset, lapVar.type) : 1;
     
-    // Check distance in meters (LapDist) or percent * 4200m estimate (LapDistPct)
     let dist = -1;
     if (lapDistVar) {
-      dist = view.getFloat32(frameOffset + lapDistVar.offset, true);
+      dist = readVarValue(view, frameOffset + lapDistVar.offset, lapDistVar.type);
     } else if (lapDistPctVar) {
-      const pct = view.getFloat32(frameOffset + lapDistPctVar.offset, true);
-      if (pct >= 0) dist = pct * 4250; // Road Atlanta full approx ~4250m
+      const pct = readVarValue(view, frameOffset + lapDistPctVar.offset, lapDistPctVar.type);
+      if (pct >= 0) dist = pct * 4250;
     }
 
-    // Lap boundary detection:
-    // 1. Explicit Lap variable bump in telemetry
-    // 2. LapDist drop: last distance was > 200m and current distance dropped by more than 100m
-    const lapVarIncremented = rawLap > currentLapNum && rawLap > 0;
-    const distDropped = lastDist > 200 && dist >= 0 && (lastDist - dist > 100);
+    // Boundary check:
+    // 1. Lap counter explicitly incremented
+    // 2. LapDist reset (distance was >150m and suddenly dropped by >100m)
+    const lapVarBumped = rawLap > currentLapNum && rawLap > 0;
+    const distReset = lastDist > 150 && dist >= 0 && (lastDist - dist > 100);
 
-    if ((lapVarIncremented || distDropped) && activeLap.sampleCount > 300) {
+    if ((lapVarBumped || distReset) && activeLap.sampleCount > 300) {
       rawLaps.push(activeLap);
-      currentLapNum = lapVarIncremented ? rawLap : currentLapNum + 1;
+      currentLapNum = lapVarBumped ? rawLap : currentLapNum + 1;
       activeLap = createNewLap(currentLapNum);
     }
 
@@ -106,14 +123,13 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
       lastDist = dist;
     }
 
-    const speed = speedVar ? view.getFloat32(frameOffset + speedVar.offset, true) * 3.6 : 0;
-    const throttle = throttleVar ? view.getFloat32(frameOffset + throttleVar.offset, true) * 100 : 0;
-    const brake = brakeVar ? view.getFloat32(frameOffset + brakeVar.offset, true) * 100 : 0;
-    const steer = steerVar ? (view.getFloat32(frameOffset + steerVar.offset, true) * 180) / Math.PI : 0;
-    const gear = gearVar ? view.getInt32(frameOffset + gearVar.offset, true) : 0;
-    const rpm = rpmVar ? view.getFloat32(frameOffset + rpmVar.offset, true) : 0;
+    const speed = speedVar ? readVarValue(view, frameOffset + speedVar.offset, speedVar.type) * 3.6 : 0;
+    const throttle = throttleVar ? readVarValue(view, frameOffset + throttleVar.offset, throttleVar.type) * 100 : 0;
+    const brake = brakeVar ? readVarValue(view, frameOffset + brakeVar.offset, brakeVar.type) * 100 : 0;
+    const steer = steerVar ? (readVarValue(view, frameOffset + steerVar.offset, steerVar.type) * 180) / Math.PI : 0;
+    const gear = gearVar ? readVarValue(view, frameOffset + gearVar.offset, gearVar.type) : 0;
+    const rpm = rpmVar ? readVarValue(view, frameOffset + rpmVar.offset, rpmVar.type) : 0;
 
-    // Build sample data
     activeLap.lapDist.push(dist >= 0 ? dist : activeLap.sampleCount * 0.5);
     activeLap.speed.push(speed);
     activeLap.throttle.push(throttle);
@@ -130,7 +146,7 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
     rawLaps.push(activeLap);
   }
 
-  // Renumber and ensure X-axis is strictly monotonic (strictly increasing) for uPlot
+  // Ensure X-axis distance array is strictly monotonic (increasing) for uPlot
   const sanitizedLaps = rawLaps.map((lap, index) => {
     const cleanDist: number[] = [];
     let currentMax = -1;
@@ -138,7 +154,7 @@ export function parseIBT(arrayBuffer: ArrayBuffer, fileName: string): ParsedIBT 
     for (let i = 0; i < lap.lapDist.length; i++) {
       let d = lap.lapDist[i];
       if (d <= currentMax) {
-        d = currentMax + 0.001; // Force strictly increasing step
+        d = currentMax + 0.001;
       }
       currentMax = d;
       cleanDist.push(d);
